@@ -1,0 +1,37 @@
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index af6179c..f36f0aa 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -2210,7 +2210,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                           NE, n, cs);
+                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
+-#if defined(STRATA_HIP_GFX906)
+         } else if (dec_batch) {
+             // gfx906: the Coder's 256-expert router (the native router is 512 x 10 only) for the whole window in one
+             // multi-column BF16 projection and one top-k, bitwise the per-token calls (route_window_parity); ~3 ms
+@@ -2218,7 +2217,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+             if (!moe_route_window(wt, g, l, K, ss.moe, mixed_ + tb * N, logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n,
+                                   cs, err))
+                 return false;
+-#endif
+         } else
+         for (int t = tb; t < te; ++t) {
+             MoEBuffers mb = ss.moe;
+diff --git a/src/kernels/route_window_parity.cpp b/src/kernels/route_window_parity.cpp
+index bb0d6b9..cdc913b 100644
+--- a/src/kernels/route_window_parity.cpp
++++ b/src/kernels/route_window_parity.cpp
+@@ -23,10 +23,11 @@ uint16_t bf16(float f) { uint32_t i; std::memcpy(&i, &f, 4); return (uint16_t) (
+ }  // namespace
+ 
+ int main() {
+-    const int N = 2560, E = 256, K = 10;
++    const int N = 2560, K = 10;
+     int bad = 0;
+     std::mt19937 rng(7);
+     std::normal_distribution<float> nd(0.0f, 1.0f);
++    for (int E = 64; E <= 512; E += 32)   // every expert count a model with fewer than 512 experts may have
+     for (int n_out : {E, 1}) {
+         for (int T : {2, 3, 4, 6}) {
+             std::vector<uint16_t> w((size_t) n_out * N);

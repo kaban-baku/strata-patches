@@ -1,0 +1,367 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c94eff4..27516f4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2189,7 +2189,7 @@ if(STRATA_NATIVE_EXPERTS)
+   endif()
+   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
+   # one-pass static linking has no cycle to resolve)
+-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
++  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/core/cpu_head.cpp)   # cpu_head (local experiment)
+   if(STRATA_CPU_X86)
+     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
+                                              src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp
+diff --git a/include/strata/core/cpu_head.hpp b/include/strata/core/cpu_head.hpp
+new file mode 100644
+index 0000000..bd6d70e
+--- /dev/null
++++ b/include/strata/core/cpu_head.hpp
+@@ -0,0 +1,57 @@
++#pragma once
++// cpu_head: the output head computed by the CPU from the pinned host copy of output.weight (a local experiment,
++// 2026-11-08).  On a card that cannot keep the head in VRAM the engine reads it over PCIe for every logits row
++// (~42 ms per row for a 497 MiB Q6_K head at ~12 GB/s on an RTX 3070 Ti Laptop); the CPU reads the same bytes from
++// RAM (~47 GB/s with 8 threads on a Ryzen 7 6800H), so the verify window rings the host once more after the last
++// layer and the host writes the logits into mapped memory (STRATA_CPU_HEAD=1).
++#include <atomic>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace strata::core {
++
++class CpuHead {
++public:
++    CpuHead() = default;
++    ~CpuHead();
++    CpuHead(const CpuHead&) = delete;
++    CpuHead& operator=(const CpuHead&) = delete;
++
++    // w: the ggml-layout head [n_out rows][n_in] of ggml type `type`, in host memory
++    bool init(int type, const void* w, int64_t n_in, int64_t n_out, int threads, std::string& err);
++    // x: rows x n_in floats; logits: rows x n_out floats (row-major, a row per token)
++    void compute(const float* x, int rows, float* logits);
++    int threads() const { return (int) workers_.size() + 1; }
++    double last_ms() const { return last_ms_; }
++
++private:
++    void work(int idx);
++    void run_part(int idx);
++
++    int type_ = -1;
++    const uint8_t* w_ = nullptr;
++    int64_t n_in_ = 0, n_out_ = 0;
++    size_t row_bytes_ = 0, xq_row_bytes_ = 0;
++    int vec_dot_type_ = -1;
++    void* vec_dot_ = nullptr;
++    std::vector<uint8_t> xq_;
++    // the job
++    int rows_ = 0;
++    float* logits_ = nullptr;
++    int n_parts_ = 1;
++    // the pool: workers 1..n-1 wait for a new generation; the caller is part 0
++    std::vector<std::thread> workers_;
++    std::mutex mu_;
++    std::condition_variable cv_;
++    uint64_t gen_ = 0;
++    std::atomic<int> pending_{0};
++    bool stop_ = false;
++    double last_ms_ = 0.0;
++};
++
++}  // namespace strata::core
+diff --git a/include/strata/core/native_head.hpp b/include/strata/core/native_head.hpp
+index 90b46e5..6a86000 100644
+--- a/include/strata/core/native_head.hpp
++++ b/include/strata/core/native_head.hpp
+@@ -25,6 +25,9 @@ public:
+     /// on the host, or a repacked layout that stays in VRAM.
+     bool to_host(std::string& err);
+     bool on_host() const { return host_ != nullptr; }
++    const void* host_weights() const { return host_; }   // cpu_head: the pinned host copy (null in VRAM)
++    int64_t n_in() const { return n_in_; }
++    int64_t n_out() const { return n_out_; }
+     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
+     uint64_t weight_bytes() const { return bytes_; }
+     bool loaded() const { return weights_ != nullptr; }
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index a0dbeda..fa2942b 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -78,6 +78,7 @@ struct AdaptGate {
+ };
+ 
+ class NativeHead;
++class CpuHead;
+ class RemoteExpertOpt;
+ 
+ /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
+@@ -701,6 +702,13 @@ private:
+     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
+     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
+     uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
++    // cpu_head (STRATA_CPU_HEAD=1): the head's rows on the CPU, rung once more after the last layer
++    CpuHead* cpu_head_ = nullptr;
++    float* h_hx_ = nullptr;  float* m_hx_ = nullptr;
++    float* h_hlog_ = nullptr;  float* m_hlog_ = nullptr;
++    uint32_t* h_hseq_ = nullptr;  uint32_t* m_hseq_ = nullptr;
++    uint32_t* h_hflag_ = nullptr;  uint32_t* m_hflag_ = nullptr;
++    double cpu_head_ms_ = 0.0;  int64_t cpu_head_rows_ = 0;
+     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
+     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
+     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+diff --git a/src/core/cpu_head.cpp b/src/core/cpu_head.cpp
+new file mode 100644
+index 0000000..65ddb4b
+--- /dev/null
++++ b/src/core/cpu_head.cpp
+@@ -0,0 +1,106 @@
++// cpu_head.cpp - see include/strata/core/cpu_head.hpp
++#include "strata/core/cpu_head.hpp"
++
++#include "ggml.h"
++#include "ggml-cpu.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstring>
++
++namespace strata::core {
++
++namespace {
++using VecDot = ggml_vec_dot_t;
++constexpr int64_t kTile = 64;   // weight rows per inner step: every token's dot against a row while it is hot
++}
++
++CpuHead::~CpuHead() {
++    {
++        std::lock_guard<std::mutex> lk(mu_);
++        stop_ = true;
++        ++gen_;
++    }
++    cv_.notify_all();
++    for (auto& t : workers_)
++        if (t.joinable()) t.join();
++}
++
++bool CpuHead::init(int type, const void* w, int64_t n_in, int64_t n_out, int threads, std::string& err) {
++    ggml_cpu_init();
++    const ggml_type t = (ggml_type) type;
++    const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu(t);
++    if (tc == nullptr || tc->vec_dot == nullptr) { err = "cpu head: no CPU dot product for head type " + std::to_string(type); return false; }
++    const ggml_type vt = tc->vec_dot_type;
++    const ggml_type_traits_cpu* vtc = ggml_get_type_traits_cpu(vt);
++    if (vt != GGML_TYPE_F32 && (vtc == nullptr || vtc->from_float == nullptr)) { err = "cpu head: no quantizer for the activation type"; return false; }
++    if (n_in % ggml_blck_size(t) != 0 || n_in % ggml_blck_size(vt) != 0) { err = "cpu head: the head width is not a whole number of blocks"; return false; }
++    type_ = type;
++    w_ = (const uint8_t*) w;
++    n_in_ = n_in;
++    n_out_ = n_out;
++    row_bytes_ = ggml_row_size(t, n_in);
++    vec_dot_type_ = (int) vt;
++    xq_row_bytes_ = ggml_row_size(vt, n_in);
++    vec_dot_ = (void*) tc->vec_dot;
++    xq_.assign(xq_row_bytes_ * 16 + 64, 0);
++    threads = std::max(1, std::min(threads, 64));
++    n_parts_ = threads;
++    for (int i = 1; i < threads; ++i) workers_.emplace_back([this, i] { work(i); });
++    return true;
++}
++
++void CpuHead::run_part(int idx) {
++    const VecDot dot = (VecDot) vec_dot_;
++    // parts are contiguous row ranges, cut on tile edges
++    const int64_t tiles = (n_out_ + kTile - 1) / kTile;
++    const int64_t t0 = tiles * idx / n_parts_, t1 = tiles * (idx + 1) / n_parts_;
++    const int64_t r0 = t0 * kTile, r1 = std::min<int64_t>(t1 * kTile, n_out_);
++    const int R = rows_;
++    for (int64_t r = r0; r < r1; ++r) {
++        const uint8_t* wr = w_ + (size_t) r * row_bytes_;
++        for (int t = 0; t < R; ++t) {
++            float s = 0.0f;
++            dot((int) n_in_, &s, 0, wr, 0, xq_.data() + (size_t) t * xq_row_bytes_, 0, 1);
++            logits_[(size_t) t * (size_t) n_out_ + (size_t) r] = s;
++        }
++    }
++}
++
++void CpuHead::work(int idx) {
++    uint64_t seen = 0;
++    for (;;) {
++        {
++            std::unique_lock<std::mutex> lk(mu_);
++            cv_.wait(lk, [&] { return gen_ != seen; });
++            seen = gen_;
++            if (stop_) return;
++        }
++        run_part(idx);
++        pending_.fetch_sub(1, std::memory_order_acq_rel);
++    }
++}
++
++void CpuHead::compute(const float* x, int rows, float* logits) {
++    const auto c0 = std::chrono::steady_clock::now();
++    if (rows > 16) rows = 16;
++    const ggml_type vt = (ggml_type) vec_dot_type_;
++    for (int t = 0; t < rows; ++t) {
++        uint8_t* dst = xq_.data() + (size_t) t * xq_row_bytes_;
++        if (vt == GGML_TYPE_F32) std::memcpy(dst, x + (size_t) t * n_in_, (size_t) n_in_ * 4);
++        else ggml_get_type_traits_cpu(vt)->from_float(x + (size_t) t * n_in_, dst, n_in_);
++    }
++    rows_ = rows;
++    logits_ = logits;
++    pending_.store(n_parts_ - 1, std::memory_order_release);
++    {
++        std::lock_guard<std::mutex> lk(mu_);
++        ++gen_;
++    }
++    cv_.notify_all();
++    run_part(0);
++    while (pending_.load(std::memory_order_acquire) != 0) std::this_thread::yield();
++    last_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
++}
++
++}  // namespace strata::core
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index a96638c..6fd61bf 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -29,6 +29,7 @@
+ #endif
+ 
+ #include "strata/core/native_head.hpp"
++#include "strata/core/cpu_head.hpp"
+ #include "strata/core/on_device.hpp"
+ #include "strata/core/peer_experts.hpp"
+ #include "strata/kernels/iq_kernels.hpp"
+@@ -607,7 +608,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
+     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
+     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
+     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
+-    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, hflag_in_h_})   // + an overlapped split's hand-off wait
++    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, hflag_in_h_, h_hflag_})   // + an overlapped split's hand-off wait
+         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+     strata_store_fence();
+@@ -760,8 +761,15 @@ Verifier::~Verifier() {
+         if (e) cudaEventDestroy(e);
+     if (arena_) cudaFree(arena_);
+     if (hcount_d_) cudaFree(hcount_d_);
++    if (cpu_head_ != nullptr) {
++        if (cpu_head_rows_ > 0)
++            std::fprintf(stderr, "strata cpu-head: %lld rows on the CPU, %.2f ms per row\n", (long long) cpu_head_rows_,
++                         cpu_head_ms_ / (double) cpu_head_rows_);
++        delete cpu_head_;
++        cpu_head_ = nullptr;
++    }
+     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
+-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
++                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_hx_, h_hlog_, h_hseq_, h_hflag_};
+     for (void* h : hosts)
+         if (h) cudaFreeHost(h);
+ }
+@@ -978,6 +986,28 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
+               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
+               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
++    // cpu_head (STRATA_CPU_HEAD=1): the head in pinned host memory is computed by the CPU, not read over PCIe by the GPU
++    {
++        const char* ch = std::getenv("STRATA_CPU_HEAD");
++        if (ch != nullptr && std::atoi(ch) != 0 && head_ != nullptr && head_->loaded() && head_->on_host() &&
++            head_->host_weights() != nullptr && lb_ == 0 && le_ == g.n_layers) {
++            const char* tn = std::getenv("STRATA_CPU_HEAD_THREADS");
++            const int nth = tn != nullptr && std::atoi(tn) > 0 ? std::atoi(tn) : 8;
++            auto* h = new CpuHead();
++            std::string herr;
++            if (!h->init(head_->type(), head_->host_weights(), (int64_t) N, (int64_t) n_vocab_, nth, herr) ||
++                !mapped(T * N * 4, (void**) &h_hx_, (void**) &m_hx_) ||
++                !mapped(T * (uint64_t) n_vocab_ * 4, (void**) &h_hlog_, (void**) &m_hlog_) ||
++                !mapped(64, (void**) &h_hseq_, (void**) &m_hseq_) || !mapped(64, (void**) &h_hflag_, (void**) &m_hflag_)) {
++                delete h;
++                std::fprintf(stderr, "strata cpu-head: not used (%s)\n", herr.empty() ? "mapped allocation failed" : herr.c_str());
++            } else {
++                cpu_head_ = h;
++                std::fprintf(stderr, "strata cpu-head: the output head (type %d, %lld x %lld) is computed by %d CPU threads from host memory\n",
++                             head_->type(), (long long) n_vocab_, (long long) N, h->threads());
++            }
++        }
++    }
+     // DFlash2 taps: set_taps (the drafter) or STRATA_TAP_FILE (the research dump); off, and nothing is allocated or captured, otherwise
+     const char* tap_path = std::getenv("STRATA_TAP_FILE");
+     if (tap_path != nullptr && tap_path[0] == '\0') tap_path = nullptr;
+@@ -2613,6 +2643,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         if (head_ != nullptr && head_->loaded()) {
+             try {
+                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
++                if (cpu_head_ != nullptr && !batch_rec_) {
++                    // cpu_head: publish this chunk's rows, wait for the CPU's logits, copy them in
++                    const uint32_t ring = (uint32_t) (h0 / kFusedGrMaxT + 1);
++                    doorbell_publish_value(head_mixed_ + (size_t) h0 * N, nullptr, nullptr, (int64_t) HT * N, 0, m_hx_, nullptr,
++                                           nullptr, m_hseq_, ring, cs);
++                    wait_flag_ge(m_hflag_, ring, cs);
++                    copy_from_mapped(hl, m_hlog_, (int64_t) HT * (int64_t) n_vocab_, cs);
++                } else {
+                 if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
+                 if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
+                     if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
+@@ -2620,6 +2658,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                                     (int) n_vocab_, (int) HT, cs);
+                 } else
+                 native_mmvq(head_->type(), head_->weights(), xq_, hl, (int) N, (int) n_vocab_, HT, cs);
++                }
+             } catch (const std::exception& e) {
+                 err = std::string("verify head: ") + e.what();
+                 return false;
+@@ -3072,6 +3111,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
+     *(volatile uint32_t*) h_flag_ = 0;
+     *(volatile uint32_t*) h_flagA_ = 0;
+     *(volatile uint32_t*) h_flagB_ = 0;
++    if (h_hseq_ != nullptr) { *(volatile uint32_t*) h_hseq_ = 0; *(volatile uint32_t*) h_hflag_ = 0; }
+     // the overlapped split: the next stage's graph is launched after this, and must see THIS window's raise
+     if (hflag_out_h_ != nullptr) *(volatile uint32_t*) hflag_out_h_ = 0;
+     if (herr_h_ != nullptr) *(volatile uint32_t*) herr_h_ = 0;
+@@ -3561,6 +3601,40 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+         if (prof_on_ && G == 1) collect_profile();
+         return true;
+     }
++    if (cpu_head_ != nullptr) {   // cpu_head: the head's chunks, rung after the last layer
++        progress_at("verify window: the CPU head", (int64_t) T);
++        volatile uint32_t* const hseq = h_hseq_;
++        const int chunks = (T + kFusedGrMaxT - 1) / kFusedGrMaxT;
++        for (int c = 0; c < chunks; ++c) {
++            const uint32_t want = (uint32_t) (c + 1);
++            const Clock::time_point a = Clock::now();
++            uint32_t spins = 0;
++            while (*hseq < want) {
++                strata_cpu_pause();
++                if ((++spins & 1023u) != 0) continue;
++                if (Clock::now() - a > std::chrono::seconds(20)) {
++                    err = "verify: the CPU head was never rung" + released_note(release_gpu_waits(5000));
++                    return false;
++                }
++                const cudaError_t q = cudaStreamQuery(cs_);
++                if (q != cudaErrorNotReady && *hseq < want) {
++                    err = std::string("verify: the CPU head was never rung (") + (q == cudaSuccess ? "graph finished" : cudaGetErrorString(q)) + ")";
++                    return false;
++                }
++            }
++            strata_load_fence();
++            const Clock::time_point b = Clock::now();
++            const int h0 = c * kFusedGrMaxT, HT = std::min(T - h0, kFusedGrMaxT);
++            cpu_head_->compute(h_hx_, HT, h_hlog_);
++            cpu_head_ms_ += cpu_head_->last_ms();
++            cpu_head_rows_ += HT;
++            std::atomic_thread_fence(std::memory_order_seq_cst);
++            strata_store_fence();
++            *(volatile uint32_t*) h_hflag_ = want;
++            ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
++            ms_pool += ms_since(b);
++        }
++    }
+     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
+     // #267: a window the GPU never finishes (a spin kernel that never sees its flag) holds the host here; the stall
+     // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
