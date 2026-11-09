@@ -32,7 +32,40 @@ products into mapped memory, and the GPU copies them back and continues (argmax,
   count (default 8). Batch windows keep the GPU path.
 - New files: `src/core/cpu_head.cpp`, `include/strata/core/cpu_head.hpp`; changes in `src/core/verify.cpp`.
 
-Measurements and the comparison with an unmodified v0.2.12 are in the issue.
+### Settings that ran on a 4 GB card (64K context)
+
+Engine arguments and environment that started without paging (the GPU-reach wait in `STRATA_DECODE_TIMING=1` stayed
+at ~12 ms; when the card pages it jumps to ~55 ms):
+
+```text
+--max-context 65536 --kv q4_0 --spec 2 (no --mtp) --kv-resident 4096 --lookup-max-t 4 --vram-reserve-mib 1112
+--resident-budget-gib 24 (or 40 on a 64 GB PC)
+STRATA_CPU_HEAD=1  STRATA_HEAD_HOST=1  STRATA_HC_Q8=1  STRATA_PREFILL_LAYER_MAJOR=0
+```
+
+- `STRATA_HC_Q8=1` is required: without it the hyper-connection projections load as BF16 (~1.2 GB more) and nothing fits.
+- 128K does not fit: with a smaller reserve it starts but pages (9-13 tok/s). Below ~900 MiB of reserve the auto expert
+  cache grows into the room the late allocations need and the card pages again.
+- The shipped defaults (MTP on) do not start on 4 GB (the expert cache is ~800 MiB short).
+- `STRATA_PREFILL_LAYER_MAJOR=0` avoids the layer-major prompt walk on small caches (see
+  [#5104](https://github.com/Niko1221/Strata/issues/5104)).
+
+### Results (decode tok/s, 64K, the 4 GB reproduction above)
+
+| model | RAM budget | official v0.2.12 (same settings) | with cpu-head |
+|---|---|---:|---:|
+| [ISTA GSQ-RCO IQ2_XS](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 40 GB | 22.8 | **30.6** |
+| [UD-IQ1_M-Fast](https://huggingface.co/kaban-baku/Qwen3.8-Flash-Next-UD-IQ1_M-Fast-GGUF) | 40 GB | 15.5 | **28.4** |
+| [UD-IQ1_M-384Exp-Fast](https://huggingface.co/kaban-baku/Qwen3.8-Flash-Next-UD-IQ1_M-384Exp-Fast-GGUF) | 24 GB | 16.9 | **28.4** |
+
+The gain grows with the head's size (Unsloth's Q6_K head is 497 MiB, GSQ's IQ4_XS head 322 MiB). On a clean v0.2.12
+tree with only this patch, GSQ IQ2_XS at 24 GB gave 22.2 tok/s (22.5 on the working build that also has
+`route-any-ne`). The 384-expert model also needs `route-any-ne` for its full speed. These are reproductions on an
+RTX 3070 Ti Laptop with VRAM held by another process, not a real 4 GB card.
+
+## 日本語の要約
+
+VRAM 4GB では出力ヘッドが入らず、エンジンはトークンごとにヘッドを PCIe で読み直しています。cpu-head はそれを CPU で計算するパッチ（`STRATA_CPU_HEAD=1`、オプトイン）です。上の設定（64K・MTP なし・予約 1112MiB など）で、公式 0.2.12 に比べて decode が 1.3〜1.8 倍になりました（8GB のカードを 4GB 相当に制限した再現）。
 
 ## License
 
