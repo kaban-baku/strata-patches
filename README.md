@@ -6,7 +6,7 @@ each is opt-in or only affects models the release does not handle yet.
 
 | Folder | What it does | Against | Issue |
 |---|---|---|---|
-| [`cpu-head/`](cpu-head/) | `STRATA_CPU_HEAD=1`: when the output head lives in pinned host memory (a card too small to keep it in VRAM), the CPU computes the logits from RAM instead of the GPU reading the head over PCIe for every row | v0.2.12 | (to be linked) |
+| [`cpu-head/`](cpu-head/) | `STRATA_CPU_HEAD=1`: when the output head lives in pinned host memory (a card too small to keep it in VRAM), the CPU computes the logits from RAM instead of the GPU reading the head over PCIe for every row | v0.2.12 | [#5659](https://github.com/Niko1221/Strata/issues/5659) |
 | [`route-any-ne/`](route-any-ne/) | `STRATA_ROUTE_PRIOR` / `STRATA_ROUTE_RESIDENT` and the windowed verify router (`moe_route_window`) on models with fewer than 512 experts | v0.2.12 (and the 0.2.11 base) | [#5287](https://github.com/Niko1221/Strata/issues/5287) |
 
 Apply from the root of a Strata source tree at the matching tag, then build as usual:
